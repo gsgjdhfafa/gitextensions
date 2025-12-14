@@ -2,30 +2,21 @@ name: GitExtensions Build (x64, arm64)
 
 on:
   pull_request:
-    branches: [ master ]
+    branches: [ master, release/* ]
   push:
-    branches: [ master ]
-  # Manually triggered via the Actions UI, with inputs
-  workflow_dispatch:
-    inputs:
-      ge-release-version:
-        description: "GE release version"
-        required: true
-        type: string
-        default: '33.33.33' # for dev
-      run-x64-tests:
-        description: "Run tests for x64 build"
-        type: boolean
-        default: true
-      run-arm64-tests:
-        description: "Run tests for arm64 build"
-        type: boolean
-        default: false # skip arm64 test by default, as it doesn't complete, resulting in timeout...
+    branches: [ master, release/* ]
 
 env:
-  # version is '33.33.33' for PR/push, or take it from user's input when manually triggered,
-  # then append the current run number
-  ge-version: ${{ github.event_name == 'workflow_dispatch' && inputs.ge-release-version || '33.33.33' }}.${{ github.run_number }}
+  # GE release version
+  ge-release-version: '6.0.5'
+  # Run tests for x64 build
+  run-x64-tests: false # TODO: turn on again when signing works
+  # Run tests for arm64 build
+  run-arm64-tests: false # skip arm64 test by default, as it doesn't complete, resulting in timeout...
+  # Disable the .NET logo in the console output.
+  DOTNET_NOLOGO: true
+  # Disable the .NET first time experience to skip caching NuGet packages and speed up the build.
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
 
 jobs:
   build:
@@ -41,6 +32,9 @@ jobs:
     timeout-minutes: 60
 
     steps:
+      - name: Append the current run number
+        run: echo "ge-version=${{ env.ge-release-version }}.${{ github.run_number }}" >> $env:GITHUB_ENV
+
       - name: Checkout
         uses: actions/checkout@v5
 
@@ -59,6 +53,9 @@ jobs:
 
       - name: Install WiX
         run: dotnet tool install --global wix
+
+      - name: Mark the repo as clean
+        run: .\eng\Mark-RepoClean.ps1      
 
       - name: Set up common build arguments
         run: |
@@ -85,6 +82,8 @@ jobs:
           echo "nativeBuildArgs=$nativeBuildArgs" >> $env:GITHUB_ENV
           $geVersionText = "${env:geVersionText}-arm64"
           echo "geVersionText=$geVersionText" >> $env:GITHUB_ENV
+          echo "buildArgs=$buildArgs"
+          echo "nativeBuildArgs=$nativeBuildArgs"
 
       - name: Set up GE version
         run: |
@@ -103,15 +102,16 @@ jobs:
           git reset --hard HEAD
 
       - name: Verify localisation of new strings
+        if: false # TODO: turn on again when signing works
         run: |
           # Verify that new strings (if any) have been processed and ready for localisation
           Push-Location .\src\app\GitExtensions
           dotnet msbuild /p:Configuration=Release /t:_UpdateEnglishTranslations /p:RunTranslationApp=true /p:ContinuousIntegrationBuild=true /v:m
           Pop-Location
 
-      - name: Test - for PR/push (but skip arm64 tests by default)
+      - name: Test - for PR/push
         id: pr_push_test
-        if: github.event_name != 'workflow_dispatch' && runner.arch != 'arm64'
+        if: github.event_name != 'workflow_dispatch' && ((runner.arch == 'arm64' && inputs.run-arm64-tests) || (runner.arch == 'x64' && inputs.run-x64-tests))
         run: dotnet test -c Release --no-restore --no-build --verbosity m --test-adapter-path:. --logger:trx /bl:.\artifacts\log\tests.binlog
 
       - name: Test - when manually triggered
@@ -121,7 +121,7 @@ jobs:
 
       - name: Upload test logs if test failure
         if: failure() && (steps.pr_push_test.conclusion == 'failure' || steps.dispatched_test.conclusion == 'failure')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: FailedTestLogs-v${{ env.ge-version }}-${{ runner.arch }}
           path: |
@@ -131,11 +131,14 @@ jobs:
 
       - name: Package GE app for deployment
         run: |
+          echo buildArgs=$env:buildArgs
           dotnet publish -c Release --no-build $env:buildArgs
 
-      - name: Upload GE distribution files - when manually triggered
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+      - name: Display artifacts
+        run: ls -R artifacts/Release/publish/
+
+      - name: Upload GE distribution files
+        uses: actions/upload-artifact@v6
         with:
           name: GE-v${{ env.ge-version }}-${{ runner.arch }}-dist
           path: |
@@ -143,3 +146,41 @@ jobs:
             artifacts/Release/publish/*.zip
           retention-days: 7
 
+  deploy:
+    name: Upload dist files to SignPath
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ success() && vars.ARTIFACT_SIGNING_ENABLED == 'true' }}
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: ./artifacts
+          #merge-multiple: true # Cannot be used because ARM64 artifacts have the same names as those for x64!
+
+      - name: Display artifacts
+        run: ls -al ./artifacts/*
+
+      - name: Set combined path
+        run: |
+          echo "combined=./artifacts/combined.`ls -d ./artifacts/GE-v*.*.*.*-X64-dist | sed 's/.\/artifacts\/GE-//' | sed 's/-X64-dist//'`.zip" >> $GITHUB_ENV
+
+      - name: Prepare artifacts signing
+        run: |
+          # archive files so we send them all in one go
+          zip --compression-method store $combined ./artifacts/*
+
+      - name: Display artifacts
+        run: |
+          ls -R artifacts/
+          unzip -ql $combined
+
+      - name: Upload to SignPath
+        if: false
+        run: |
+          echo "Uploading $combined to SignPath..."
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.SIGNPATH_SECRET }}" \
+            -H "Content-Type: application/zip" \
+            --data-binary "@${{ env.combined }}" \
+            "https://app.signpath.io/API/v1/7c19b2cf-90f7-4d15-9b12-1b615f7c18c4/Integrations/AppVeyor?ProjectKey=GitExtensions_combined&SigningPolicyKey=release-2020"
